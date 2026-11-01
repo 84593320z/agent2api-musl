@@ -1,0 +1,150 @@
+name: build-musl-server
+
+# 独立的「构建仓库」：只放这一个工作流，不放上游代码。
+# 每次运行都去上游仓库按 tag 取源码 → 交叉编译 aarch64/x86_64 musl 静态包 →
+# 用**同一个 tag** 在本仓库发 Release。
+#
+# 这样就不存在「fork 和上游不同步」的问题：代码永远是构建那一刻从上游拉的，
+# 本地一行都不存。上游怎么改，下一次构建自动跟上。
+#
+# 触发：
+#   · 每天 04:00 UTC 自动查一次上游有没有新 tag（有新 tag 才构建）
+#   · 手动 workflow_dispatch，可指定 tag（留空 = 上游最新）
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要构建的上游 tag（留空 = 自动取上游最新的 beta）'
+        required: false
+        type: string
+      force:
+        description: '即使本仓库已有同名 Release 也重新构建'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-musl-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - name: 选定 tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG=$(gh api "repos/aimod-cc/Agent2API/releases?per_page=100" \
+                  --jq '[.[].tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+"))] | first')
+          fi
+          [ -n "$TAG" ] || { echo "::error::取不到上游 tag"; exit 1; }
+          echo "上游 tag: $TAG"
+
+          EXISTS=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq .tag_name 2>/dev/null || true)
+          if [ -n "$EXISTS" ] && [ "${FORCE:-false}" != "true" ]; then
+            echo "本仓库已有 $TAG 的 Release，跳过构建"
+            BUILD="no"
+          else
+            BUILD="yes"
+          fi
+          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'yes'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+    steps:
+      - name: 按 tag 取上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: aimod-cc/Agent2API
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: 安装 Rust（带 musl target）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri
+          key: musl-${{ matrix.target }}-${{ needs.resolve.outputs.tag }}
+
+      - name: 安装 zig 与 cargo-zigbuild
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --user 'ziglang==0.13.0'
+          cargo install --locked cargo-zigbuild
+
+      - name: 编译
+        working-directory: desktop-tauri/src-tauri
+        run: cargo zigbuild --release -p agent2api-server --target "${{ matrix.target }}"
+
+      - name: 自检（必须静态）
+        working-directory: desktop-tauri/src-tauri
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/agent2api-server"
+          test -x "$BIN"
+          if readelf -l "$BIN" | grep -q INTERP; then
+            echo "::error::产物是动态链接，拒绝发布"; exit 1
+          fi
+          file "$BIN"
+
+      - name: 打包
+        working-directory: desktop-tauri/src-tauri
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/agent2api-server"
+          NAME="agent2api-server-linux-${{ matrix.arch }}-musl.tar.gz"
+          tar -czf "$NAME" -C "$(dirname "$BIN")" agent2api-server
+          sha256sum "$NAME" > "$NAME.sha256"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          mv "$NAME" "$NAME.sha256" "$GITHUB_WORKSPACE/out/"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-server-linux-${{ matrix.arch }}-musl
+          path: out/*
+          if-no-files-found: error
+
+      - name: 发同名 tag 的 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }} (musl 静态)
+          body: |
+            上游 tag `${{ needs.resolve.outputs.tag }}` 的 musl 静态构建。
+
+            - 单文件、无 PT_INTERP，不需要 `/lib/ld-linux-*`，不受宿主 glibc 版本影响
+            - 产物：`agent2api-server-linux-{arm64,amd64}-musl.tar.gz` + `.sha256`
+            - 由 `.github/workflows/build-musl.yml` 自动生成，源码取自上游该 tag
+          prerelease: ${{ contains(needs.resolve.outputs.tag, '-') }}
+          files: out/*

@@ -123,6 +123,32 @@ jobs:
           fi
           file "$BIN"
 
+      # 静态 musl 的解析器路径是编译期常量（/etc/resolv.conf）。
+      # Android 上没有这个文件，内核也不会让模块往 /etc 写，所以这里做**等长改写**：
+      # /etc/resolv.conf (16B) -> /data/a2a/resolv (16B)。等长不会破坏 ELF 布局。
+      - name: 改写解析器路径（等长）
+        working-directory: desktop-tauri/src-tauri
+        run: |
+          set -euo pipefail
+          TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+          BIN="$TARGET_DIR/${{ matrix.target }}/release/agent2api-server"
+          python3 - "$BIN" <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          old, new = b"/etc/resolv.conf", b"/data/a2a/resolv"
+          assert len(old) == len(new), (len(old), len(new))
+          d = bytearray(open(p, "rb").read())
+          n = d.count(old)
+          print("原路径出现次数:", n, " 已有私有路径:", d.count(new))
+          if n:
+              d = d.replace(old, new)
+              open(p, "wb").write(bytes(d))
+              print("已改写", n, "处")
+          else:
+              print("无需改写（可能上游已支持配置路径）")
+          PYEOF
+          file "$BIN"
+
       - name: 打包
         working-directory: desktop-tauri/src-tauri
         run: |

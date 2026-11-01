@@ -113,8 +113,11 @@ jobs:
         working-directory: desktop-tauri/src-tauri
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/agent2api-server"
-          test -x "$BIN"
+          # 上游 .cargo/config.toml 把 target-dir 指到了仓库根的 target/，
+          # 不能假设产物在 src-tauri/target 下，从 cargo 自己问出来最稳。
+          TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+          BIN="$TARGET_DIR/${{ matrix.target }}/release/agent2api-server"
+          test -x "$BIN" || { echo "::error::没找到产物 $BIN"; exit 1; }
           if readelf -l "$BIN" | grep -q INTERP; then
             echo "::error::产物是动态链接，拒绝发布"; exit 1
           fi
@@ -124,7 +127,8 @@ jobs:
         working-directory: desktop-tauri/src-tauri
         run: |
           set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/agent2api-server"
+          TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+          BIN="$TARGET_DIR/${{ matrix.target }}/release/agent2api-server"
           NAME="agent2api-server-linux-${{ matrix.arch }}-musl.tar.gz"
           tar -czf "$NAME" -C "$(dirname "$BIN")" agent2api-server
           sha256sum "$NAME" > "$NAME.sha256"

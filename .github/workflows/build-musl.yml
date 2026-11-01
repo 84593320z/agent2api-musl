@@ -156,7 +156,15 @@ jobs:
           TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
           BIN="$TARGET_DIR/${{ matrix.target }}/release/agent2api-server"
           NAME="agent2api-server-linux-${{ matrix.arch }}-musl.tar.gz"
-          tar -czf "$NAME" -C "$(dirname "$BIN")" agent2api-server
+          # 官方 payload 里还有 ui/（前端静态文件），安装器会校验它是否完整。
+          # 只塞一个二进制会被判「UI 不完整」并回滚，所以这里一并打进去。
+          UI="$GITHUB_WORKSPACE/desktop-tauri/ui"
+          test -d "$UI"
+          STAGE=$(mktemp -d)
+          cp "$BIN" "$STAGE/agent2api-server"
+          cp -R "$UI" "$STAGE/ui"
+          tar -czf "$NAME" -C "$STAGE" agent2api-server ui
+          ls -l "$STAGE"; du -sh "$STAGE/ui"
           sha256sum "$NAME" > "$NAME.sha256"
           mkdir -p "$GITHUB_WORKSPACE/out"
           mv "$NAME" "$NAME.sha256" "$GITHUB_WORKSPACE/out/"
